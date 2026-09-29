@@ -35,10 +35,10 @@ CREATE TABLE IF NOT EXISTS datasets (
 );
 
 CREATE TABLE IF NOT EXISTS dataset_sources (
-    dataset_id       bigint NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
-    source_id        bigint NOT NULL REFERENCES sources(source_id) ON DELETE RESTRICT,
-    source_role      text NOT NULL DEFAULT 'primary'
-                     CHECK (source_role IN ('primary', 'supplementary', 'methodology')),
+    dataset_id           bigint NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
+    source_id            bigint NOT NULL REFERENCES sources(source_id) ON DELETE RESTRICT,
+    source_role          text NOT NULL DEFAULT 'primary'
+                         CHECK (source_role IN ('primary', 'supplementary', 'methodology')),
     transformation_notes text,
     PRIMARY KEY (dataset_id, source_id)
 );
@@ -54,17 +54,17 @@ CREATE TABLE IF NOT EXISTS dataset_releases (
 );
 
 CREATE TABLE IF NOT EXISTS series (
-    series_id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    dataset_id         bigint NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
-    code               text,
-    name               text NOT NULL,
-    description        text,
-    unit               text NOT NULL,
-    frequency          text NOT NULL
-                       CHECK (frequency IN ('annual', 'quarterly', 'monthly', 'weekly', 'daily', 'irregular')),
-    geography_name     text,
-    geography_code     text,
-    geography_level    text,
+    series_id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    dataset_id          bigint NOT NULL REFERENCES datasets(dataset_id) ON DELETE CASCADE,
+    code                text NOT NULL,
+    name                text NOT NULL,
+    description         text,
+    unit                text NOT NULL,
+    frequency           text NOT NULL
+                        CHECK (frequency IN ('annual', 'quarterly', 'monthly', 'weekly', 'daily', 'irregular')),
+    geography_name      text,
+    geography_code      text NOT NULL DEFAULT 'ALL',
+    geography_level     text,
     seasonal_adjustment text,
     UNIQUE (dataset_id, code, geography_code)
 );
@@ -78,7 +78,10 @@ CREATE TABLE IF NOT EXISTS observations (
                       CHECK (status IN ('observed', 'estimated', 'provisional', 'revised', 'missing')),
     observation_note  text,
     PRIMARY KEY (series_id, period_start),
-    CHECK (status = 'missing' OR value IS NOT NULL)
+    CHECK (
+        (status = 'missing' AND value IS NULL)
+        OR (status <> 'missing' AND value IS NOT NULL)
+    )
 );
 
 CREATE TABLE IF NOT EXISTS cleaning_runs (
