@@ -1,42 +1,69 @@
-# Research data database
+# Macroeconomic research database
 
-This directory contains the first PostgreSQL schema for the Economics Society's research starter pack.
+The society’s portable research snapshot is `macro_research.sqlite.gz`. It is a compressed SQLite database; decompress it once to use the SQLite file directly.
 
-## What it stores
+## What is in this release
 
-- **Sources**: publisher, dataset links, citations, licenses, and access dates.
-- **Datasets and releases**: subject, scope, review status, version, and changelog.
-- **Series**: indicator definitions, units, frequency, geography, and adjustments.
-- **Observations**: cleaned values alongside the original source value and any status or note.
-- **Cleaning runs**: the script and code revision used to produce a dataset release.
+Retrieved on **2026-09-29**, the snapshot includes:
 
-## Apply the schema
+- The 217 World Bank country/economy entries, with World Bank codes, ISO-2 codes, regions, income groups, and lending types.
+- **96,475 annual observations** from World Development Indicators, from 2000 through each indicator’s latest available year.
+- 19 populated indicator series, including source-reported data and clearly marked calculated nominal-growth series.
 
-Create an empty PostgreSQL database, then run:
+Populated indicators include nominal GDP and real GDP (in US dollars and local currency), nominal and real GDP per capita, annual real GDP growth, real GDP-per-capita growth, nominal GDP growth calculated in local currency, GNI per capita at PPP, life expectancy, ILO-modelled unemployment, the $3.00/day poverty measure in 2021 PPP, annual CPI and inflation, and population.
+
+Coverage varies by indicator. For example, the current snapshot has life-expectancy observations through 2024 and most other WDI series through 2025. Missing values are absent, not filled with zero. Check actual coverage with the `indicator_coverage` view.
+
+Use `wb_code` (the World Bank three-letter code) to join country data. `serial_no` is only a convenient row number, not a ranking or permanent identifier.
+
+## Quarterly and monthly series
+
+The indicator catalog also defines the planned quarterly GDP and GDP-per-capita series, monthly CPI and inflation, central-bank policy rate, and producer-price index. These **are not populated in this snapshot**: the IMF API returned HTTP 401 during retrieval in this environment. The refresh script supports them when IMF API access is configured. IMF identifies QNEA as its quarterly national-accounts source and publishes separate CPI, interest-rate, and producer-price datasets. [IMF data API](https://data.imf.org/en/Resource-Pages/IMF-API) · [QNEA](https://data.imf.org/en/datasets/IMF.STA%3AQNEA)
+
+WPI is not filled using PPI: those are different price measures. The global catalog marks WPI as requiring country-specific sources, while IMF PPI is a separate registered indicator.
+
+## Open and query the snapshot
+
+From the repository root:
 
 ```sh
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/schema.sql
+gzip -dk database/macro_research.sqlite.gz
+sqlite3 database/macro_research.sqlite
 ```
 
-Keep credentials in a local environment file or a managed secret store. Never commit database passwords, API keys, or private participant data.
+Example query:
 
-## Data conventions
+```sql
+SELECT c.country_name, o.period, o.value
+FROM observations AS o
+JOIN countries AS c ON c.wb_code = o.country_code
+WHERE o.country_code = 'IND'
+  AND o.indicator_code = 'gdp_real_growth_yoy_pct_annual'
+ORDER BY o.period;
+```
 
-- Store every observation's period as the first calendar date of its period: January 1 for annual data, the first day of the quarter for quarterly data, and the first day of the month for monthly data.
-- Store values in the unit declared by the series. Preserve the source representation in `raw_value`.
-- Use a null `value` with status `missing` for unavailable values; explain meaningful gaps or transformations in notes.
-- Record source, license, citation, and cleaning details before marking a dataset `released`.
-- Version releases when cleaning or source revisions change the delivered data.
+The SQLite file includes `countries`, `sources`, `indicators`, `observations`, and `source_snapshots` tables, plus `indicator_coverage` and `research_observations` views. Observation rows retain the indicator code, original source-series code, raw numeric text, and whether the value is observed, estimated, derived, or forecast.
 
-## Next step
+## Refresh the data
 
-Choose the first public source datasets and confirm their redistribution terms. Then add reproducible import/cleaning scripts, a data dictionary, and versioned starter data.
+The builder uses Python’s standard library and the World Bank API; it needs an internet connection.
 
-## World Bank country and economy reference list
+```sh
+python3 database/scripts/refresh_macro_database.py --output database/macro_research.sqlite
+```
 
-- `wdi_countries.sql` creates and populates a PostgreSQL reference table with the current WDI country/economy entries from the World Bank Countries API.
-- The list contains 217 entries as retrieved on 2026-09-29. World Bank regional and income aggregates are excluded.
-- `serial_no` follows the API's World Bank code order; it is only a row number, not a ranking. Keep `wb_code` as the stable identifier when joining data.
-- The file preserves World Bank names, ISO-2 and World Bank codes, region, income level, and lending type.
-- To load it into the same database, run: `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/wdi_countries.sql`.
-- Source: [World Bank Countries API](https://api.worldbank.org/v2/country?format=json&per_page=400); dataset context and licensing: [World Development Indicators catalog](https://datacatalog.worldbank.org/search/dataset/0037712/world-development-indicators) (CC BY 4.0).
+That command refreshes the annual WDI release. IMF quarterly and monthly series require an IMF API subscription key. Configure `IMF_API_SUBSCRIPTION_KEY` in a local environment or secret manager, then run:
+
+```sh
+python3 database/scripts/refresh_macro_database.py --include-imf --output database/macro_research.sqlite
+```
+
+Never commit the key. The resulting IMF observations keep IMF source-series metadata and citations, and per-person quarterly GDP is marked estimated because it uses interpolated annual population. Growth definitions distinguish year-over-year rates from non-annualized quarter-over-quarter rates.
+
+## Sources and reuse
+
+The populated World Bank data are from [World Development Indicators](https://datacatalog.worldbank.org/search/dataset/0037712/world-development-indicators), licensed **CC BY 4.0**. Attribute the World Bank and the specific indicator codes when reusing the data. [World Bank API documentation](https://datahelpdesk.worldbank.org/knowledgebase/articles/889392)
+
+IMF data are not included in this release. When added, cite the IMF dataset and follow its [statistical-data usage terms](https://www.imf.org/en/about/copyright-and-terms).
+
+`schema.sql` and `wdi_countries.sql` provide the PostgreSQL design/seed for a later hosted database. The SQLite snapshot is the database members can use locally or in project repositories now.
