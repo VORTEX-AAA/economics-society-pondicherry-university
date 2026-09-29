@@ -31,3 +31,12 @@ Keep credentials in a local environment file or a managed secret store. Never co
 ## Next step
 
 Choose the first public source datasets and confirm their redistribution terms. Then add reproducible import/cleaning scripts, a data dictionary, and versioned starter data.
+
+## World Bank country and economy reference list
+
+- `wdi_countries.sql` creates and populates a PostgreSQL reference table with the current WDI country/economy entries from the World Bank Countries API.
+- The list contains 217 entries as retrieved on 2026-09-29. World Bank regional and income aggregates are excluded.
+- `serial_no` follows the API's World Bank code order; it is only a row number, not a ranking. Keep `wb_code` as the stable identifier when joining data.
+- The file preserves World Bank names, ISO-2 and World Bank codes, region, income level, and lending type.
+- To load it into the same database, run: `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f database/wdi_countries.sql`.
+- Source: [World Bank Countries API](https://api.worldbank.org/v2/country?format=json&per_page=400); dataset context and licensing: [World Development Indicators catalog](https://datacatalog.worldbank.org/search/dataset/0037712/world-development-indicators) (CC BY 4.0).
