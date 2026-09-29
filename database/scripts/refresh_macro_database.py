@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """Build the Economics Society's documented SQLite macro-data snapshot.
 
-The script uses public World Bank and IMF statistical APIs. It preserves source
-frequency, source codes, units/metadata, and marks values calculated from source
-observations as derived or estimated. Missing observations are not filled.
+The script uses public World Bank, IMF, and India OEA sources. It stores annual
+WDI series and quarterly series only. Monthly IMF/OEA inputs are aggregated to
+quarterly values and are not stored. Missing observations are not filled.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
+import gzip
+import io
 import json
 import math
 import os
+import posixpath
+import shutil
 import sqlite3
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
@@ -70,6 +77,14 @@ DERIVED_INDICATORS = [
     ("gdp_real_growth_qoq_pct_quarterly_sa", "Real GDP growth, quarter over quarter (seasonally adjusted)", "percent", "Percent change from the previous quarter in seasonally adjusted real GDP; not annualized."),
     ("gdp_nominal_per_capita_growth_qoq_pct_quarterly_sa", "Nominal GDP per-capita growth, quarter over quarter (seasonally adjusted)", "percent", "Percent change from the previous quarter in estimated seasonally adjusted nominal GDP per capita; not annualized."),
     ("gdp_real_per_capita_growth_qoq_pct_quarterly_sa", "Real GDP per-capita growth, quarter over quarter (seasonally adjusted)", "percent", "Percent change from the previous quarter in estimated seasonally adjusted real GDP per capita; not annualized."),
+]
+
+QUARTERLY_PRICE_INDICATORS = [
+    ("cpi_index_all_items_quarterly_imf", "Consumer price index, quarterly mean (all items)", "index points (country reference period varies)", "Arithmetic mean of three monthly IMF all-items CPI index observations; complete quarters only. The index reference period varies by economy."),
+    ("inflation_consumer_prices_yoy_pct_quarterly_imf", "CPI inflation, year over year (quarterly)", "percent", "Calculated as 100 * (quarterly mean CPI / quarterly mean CPI four quarters earlier - 1). CPI quarter means require all three monthly index values."),
+    ("central_bank_policy_rate_pct_pa_quarterly_imf", "Central bank policy rate, quarter-end", "percent per annum", "Last reported monthly policy/central-bank rate in the quarter; source is IMF MFS interest rates. Monthly source values are not stored."),
+    ("producer_price_index_quarterly_imf", "Producer price index, quarterly mean", "index points (reference period varies)", "Arithmetic mean of three monthly IMF producer-price index observations; complete quarters only. This is PPI, not WPI."),
+    ("wholesale_price_index_quarterly", "Wholesale price index, quarterly mean (India)", "index points (2022-23=100)", "Arithmetic mean of three monthly all-commodities WPI values from India's Office of the Economic Adviser, base 2022-23=100. This release currently covers India from 2023 Q2 onward; later values may be provisional."),
 ]
 
 IMF_SLUGS = {
@@ -246,7 +261,7 @@ def create_database(path: Path) -> sqlite3.Connection:
         frequency TEXT NOT NULL,
         value REAL NOT NULL,
         raw_value TEXT,
-        value_status TEXT NOT NULL CHECK(value_status IN ('observed','estimated','derived','forecast')),
+        value_status TEXT NOT NULL CHECK(value_status IN ('observed','estimated','derived','forecast','provisional')),
         source_id TEXT NOT NULL REFERENCES sources(source_id),
         source_series_code TEXT NOT NULL,
         seasonal_adjustment TEXT,
@@ -273,6 +288,86 @@ def create_database(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def publish_database(conn: sqlite3.Connection, building_path: Path, output_path: Path) -> None:
+    """Close, validate, then atomically replace the last good snapshot."""
+    conn.execute("PRAGMA optimize")
+    conn.close()
+    check = sqlite3.connect(building_path)
+    integrity = check.execute("PRAGMA integrity_check").fetchone()[0]
+    check.close()
+    if integrity != "ok":
+        raise RuntimeError(f"SQLite integrity check failed: {integrity}")
+    building_path.replace(output_path)
+
+
+def export_release(database_path: Path) -> tuple[Path, Path, Path]:
+    """Write atomic compressed and CSV companions for a published SQLite snapshot."""
+    database_path = database_path.resolve()
+    parent = database_path.parent
+    stem = database_path.stem
+    gzip_path = parent / f"{database_path.name}.gz"
+    latest_path = parent / f"{stem}_latest.csv"
+    all_path = parent / f"{stem}_all_observations.csv.gz"
+    gzip_building = gzip_path.with_name(gzip_path.name + ".building")
+    latest_building = latest_path.with_name(latest_path.name + ".building")
+    all_building = all_path.with_name(all_path.name + ".building")
+
+    with database_path.open("rb") as src, gzip_building.open("wb") as raw:
+        with gzip.GzipFile(filename="", fileobj=raw, mode="wb", compresslevel=9, mtime=0) as compressed:
+            shutil.copyfileobj(src, compressed, length=1024 * 1024)
+
+    con = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+    latest_query = """
+        WITH ranked AS (
+            SELECT r.*,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY wb_code, indicator_code ORDER BY period DESC
+                   ) AS rn
+            FROM research_observations AS r
+        )
+        SELECT country_name, wb_code, wb_region, income_level, display_name,
+               indicator_code, period, frequency, value, unit, value_status,
+               source_id, source_series_code
+        FROM ranked WHERE rn=1
+        ORDER BY country_name, indicator_code
+    """
+    all_query = """
+        SELECT serial_no, wb_code, country_name, wb_region, income_level,
+               indicator_code, display_name, period, frequency, value, unit,
+               value_status, seasonal_adjustment, source_id, source_series_code,
+               observation_metadata
+        FROM research_observations
+        ORDER BY wb_code, indicator_code, period
+    """
+    latest_headers = [
+        "country_name", "wb_code", "wb_region", "income_level", "indicator",
+        "indicator_code", "latest_available_period", "frequency", "value", "unit",
+        "value_status", "source_id", "source_series_code",
+    ]
+    try:
+        with latest_building.open("w", encoding="utf-8-sig", newline="") as out:
+            writer = csv.writer(out)
+            writer.writerow(latest_headers)
+            writer.writerows(con.execute(latest_query))
+
+        with all_building.open("wb") as raw:
+            with gzip.GzipFile(filename="", fileobj=raw, mode="wb", compresslevel=9, mtime=0) as compressed:
+                text = io.TextIOWrapper(compressed, encoding="utf-8", newline="")
+                writer = csv.writer(text, lineterminator="\n")
+                cursor = con.execute(all_query)
+                writer.writerow([column[0] for column in cursor.description])
+                writer.writerows(cursor)
+                text.flush()
+                text.detach()
+    finally:
+        con.close()
+
+    gzip_building.replace(gzip_path)
+    latest_building.replace(latest_path)
+    all_building.replace(all_path)
+    return gzip_path, latest_path, all_path
+
+
 def quarter_index(period: str) -> int:
     year, quarter = period.split("-Q")
     return int(year) * 4 + int(quarter) - 1
@@ -295,6 +390,210 @@ def quarter_pop(pop: dict[int, float], period: str) -> float | None:
             weight = (target - t0) / (t1 - t0)
             return v0 + weight * (v1 - v0)
     return None
+
+
+def month_to_quarter(period: str) -> str:
+    year, month = period.split("-M")
+    m = int(month)
+    return f"{year}-Q{(m - 1) // 3 + 1}"
+
+
+def quarter_lag(period: str, lag: int) -> str:
+    year, quarter = period.split("-Q")
+    index = int(year) * 4 + int(quarter) - 1 - lag
+    prior_year, remainder = divmod(index, 4)
+    return f"{prior_year}-Q{remainder + 1}"
+
+
+def public_imf_row(row: dict[str, Any]) -> bool:
+    attrs = row.get("obs_attrs", {})
+    sharing = attrs.get("ACCESS_SHARING_LEVEL")
+    security = attrs.get("SECURITY_CLASSIFICATION")
+    return (sharing in (None, "PUBLIC_OPEN")) and (security in (None, "PUB"))
+
+
+def aggregate_imf_monthly(rows: list[dict[str, Any]], country_codes: set[str], method: str) -> list[dict[str, Any]]:
+    """Turn monthly IMF source rows into quarterly values without storing monthly observations."""
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        dims = row["dims"]
+        country = dims.get("COUNTRY")
+        if country not in country_codes or not public_imf_row(row):
+            continue
+        period = row["period"]
+        if "-M" not in period:
+            continue
+        series_dims = {k: v for k, v in dims.items() if k != "COUNTRY"}
+        series_base = "|".join(f"{k}={series_dims[k]}" for k in sorted(series_dims))
+        grouped[(country, series_base, month_to_quarter(period))].append(row)
+
+    out: list[dict[str, Any]] = []
+    for (country, series_base, quarter), values in grouped.items():
+        by_month = {row["period"]: row for row in values}
+        ordered_periods = sorted(by_month)
+        if method == "quarterly_mean":
+            year, q = quarter.split("-Q")
+            first_month = (int(q) - 1) * 3 + 1
+            expected = [f"{year}-M{m:02d}" for m in range(first_month, first_month + 3)]
+            if any(m not in by_month for m in expected):
+                continue
+            source_periods = expected
+            selected = [by_month[m] for m in expected]
+            value = sum(r["value"] for r in selected) / 3
+        elif method == "quarter_end":
+            if not ordered_periods:
+                continue
+            source_periods = [ordered_periods[-1]]
+            selected = [by_month[source_periods[0]]]
+            value = selected[0]["value"]
+        else:
+            raise ValueError(f"Unsupported monthly-to-quarterly method: {method}")
+        sample = selected[-1]
+        dims = sample["dims"]
+        source_code = f"IMF|{series_base}|aggregation={method}"
+        estimated = any(r["obs_attrs"].get("DERIVATION_TYPE", "O") != "O" for r in selected)
+        metadata = {
+            "aggregation_method": method,
+            "source_months": source_periods,
+            "source_observation_count": len(selected),
+            "source_series_dimensions": dims,
+            "source_derivation_types": [r["obs_attrs"].get("DERIVATION_TYPE", "O") for r in selected],
+        }
+        out.append({
+            "country": country,
+            "period": quarter,
+            "value": value,
+            "raw": None,
+            "status": "estimated" if estimated else "derived",
+            "series_code": source_code,
+            "dims": dims,
+            "metadata": metadata,
+        })
+    return out
+
+
+def add_quarterly_cpi_inflation(conn: sqlite3.Connection, records: list[dict[str, Any]]) -> int:
+    levels: dict[tuple[str, str], dict[str, float]] = defaultdict(dict)
+    for row in records:
+        levels[(row["country"], row["series_code"])][row["period"]] = row["value"]
+    inserted = 0
+    for (country, source_code), values in levels.items():
+        for period, value in values.items():
+            prior = values.get(quarter_lag(period, 4))
+            if prior is None or prior == 0:
+                continue
+            out_code = f"derived_yoy:{source_code}"
+            add_observation(conn, country=country, indicator="inflation_consumer_prices_yoy_pct_quarterly_imf",
+                            period=period, frequency="quarterly", value=(value / prior - 1) * 100,
+                            raw=None, status="derived", source="IMF_CPI", series_code=out_code,
+                            metadata={"formula":"100 * (quarterly_mean_cpi / same_quarter_prior_year_mean_cpi - 1)",
+                                      "source_cpi_series_code":source_code,"comparison_period":quarter_lag(period,4)})
+            inserted += 1
+    return inserted
+
+
+def xlsx_first_sheet_rows(body: bytes) -> list[list[str | None]]:
+    """Read a simple first worksheet from an .xlsx file using only the standard library."""
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    pkg_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    with zipfile.ZipFile(io.BytesIO(body)) as archive:
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        first_sheet = next(workbook.iter(f"{{{main_ns}}}sheet"))
+        relation_id = first_sheet.attrib[f"{{{rel_ns}}}id"]
+        relations = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        target = next(r.attrib["Target"] for r in relations.iter(f"{{{pkg_rel_ns}}}Relationship") if r.attrib["Id"] == relation_id)
+        sheet_path = posixpath.normpath(posixpath.join("xl", target))
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            strings = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in strings.iter(f"{{{main_ns}}}si"):
+                shared.append("".join(t.text or "" for t in item.iter(f"{{{main_ns}}}t")))
+        sheet = ET.fromstring(archive.read(sheet_path))
+        rows: list[list[str | None]] = []
+        for row in sheet.iter(f"{{{main_ns}}}row"):
+            cells: dict[int, str | None] = {}
+            for cell in row.iter(f"{{{main_ns}}}c"):
+                ref = cell.attrib.get("r", "")
+                letters = "".join(ch for ch in ref if ch.isalpha())
+                column = 0
+                for ch in letters:
+                    column = column * 26 + ord(ch.upper()) - 64
+                value_node = cell.find(f"{{{main_ns}}}v")
+                if cell.attrib.get("t") == "inlineStr":
+                    value = "".join(t.text or "" for t in cell.iter(f"{{{main_ns}}}t"))
+                elif value_node is None:
+                    value = None
+                elif cell.attrib.get("t") == "s":
+                    value = shared[int(value_node.text or "0")]
+                else:
+                    value = value_node.text
+                cells[column] = value
+            if cells:
+                rows.append([cells.get(i) for i in range(1, max(cells) + 1)])
+        return rows
+
+
+class OEAWpiLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+        href = dict(attrs).get("href")
+        if href and "wpi_monthly_index" in href.lower() and href.lower().endswith(".xlsx"):
+            self.links.append(href)
+
+
+def fetch_india_wpi_quarterly() -> tuple[list[dict[str, Any]], str, int]:
+    page_url = "https://eaindustry.nic.in/download_data_2223.asp"
+    html = request_bytes(page_url, "text/html; charset=utf-8").decode("utf-8", "replace")
+    parser = OEAWpiLinkParser()
+    parser.feed(html)
+    if not parser.links:
+        raise RuntimeError("Office of the Economic Adviser WPI workbook link was not found.")
+    file_url = urllib.parse.urljoin(page_url, parser.links[0])
+    body = request_bytes(file_url, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    rows = xlsx_first_sheet_rows(body)
+    if not rows or len(rows[0]) < 5:
+        raise RuntimeError("Office of the Economic Adviser WPI workbook has an unexpected layout.")
+    headers = rows[0]
+    all_row = next((row for row in rows[1:] if len(row) >= 3 and row[2] == "1000000000"), None)
+    if all_row is None:
+        raise RuntimeError("All-commodities WPI row was not found in the official workbook.")
+    monthly: dict[str, float] = {}
+    for i, header in enumerate(headers[4:], start=4):
+        if not header or i >= len(all_row) or all_row[i] in (None, ""):
+            continue
+        try:
+            date = dt.datetime.strptime(str(header), "%b-%y")
+            monthly[f"{date.year}-M{date.month:02d}"] = float(all_row[i])
+        except (ValueError, TypeError):
+            continue
+    by_quarter: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    for period, value in monthly.items():
+        by_quarter[month_to_quarter(period)].append((period, value))
+    ordered_months = sorted(monthly)
+    provisional_months = set(ordered_months[-2:])
+    result = []
+    for quarter, entries in sorted(by_quarter.items()):
+        if len(entries) != 3:
+            continue
+        entries.sort()
+        result.append({
+            "country": "IND",
+            "period": quarter,
+            "value": sum(v for _, v in entries) / 3,
+            "raw": None,
+            "status": "provisional" if any(m in provisional_months for m, _ in entries) else "derived",
+            "series_code": "OEA_WPI|ALL_COMMODITIES|2022-23=100|quarterly_mean",
+            "metadata": {"source_months":[m for m, _ in entries],"aggregation_method":"arithmetic_mean",
+                         "source_row_code":"1000000000","base_period":"2022-23=100",
+                         "provisional_months":sorted(provisional_months.intersection(m for m, _ in entries))},
+        })
+    return result, file_url, len(monthly)
 
 
 def add_indicator(conn: sqlite3.Connection, code: str, name: str, frequency: str, unit: str, definition: str, source_id: str | None, series_code: str | None, calculation: str | None = None, availability: str = "loaded") -> None:
@@ -321,11 +620,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("database/macro_research.sqlite"), help="SQLite output path (default: database/macro_research.sqlite)")
     parser.add_argument("--start-year", type=int, default=START_YEAR, help="First year/quarter/month to retrieve (default: 2000)")
-    parser.add_argument("--include-imf", action="store_true", help="Also fetch IMF quarterly/monthly datasets; requires IMF_API_SUBSCRIPTION_KEY in the environment")
+    parser.add_argument("--annual-only", action="store_true", help="Fetch annual World Bank data only; omit quarterly IMF and India WPI series")
     args = parser.parse_args()
     START_YEAR = args.start_year
-    if args.include_imf and not os.environ.get("IMF_API_SUBSCRIPTION_KEY"):
-        parser.error("--include-imf requires IMF_API_SUBSCRIPTION_KEY; do not put the key in the repository or command history")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    building_path = args.output.with_name(args.output.name + ".building")
+    if building_path.exists():
+        building_path.unlink()
     now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
     end_year = dt.date.today().year
     end_month = dt.date.today().month
@@ -333,17 +634,18 @@ def main() -> int:
     country_codes = {row["id"] for row in countries}
     print(f"World Bank country/economy rows: {len(countries)}", flush=True)
 
-    conn = create_database(args.output)
+    conn = create_database(building_path)
     conn.executemany("INSERT INTO countries VALUES(?,?,?,?,?,?,?,?,?,?)", [
         (i,row["id"],row["iso2Code"],row["name"],row["region"]["id"],row["region"]["value"].strip(),row["incomeLevel"]["id"],row["incomeLevel"]["value"].strip(),row["lendingType"]["id"],row["lendingType"]["value"].strip())
         for i,row in enumerate(countries,1)
     ])
     source_rows = [
-        ("WB_WDI","World Bank","World Development Indicators","https://datacatalog.worldbank.org/search/dataset/0037712/world-development-indicators",f"{WB_API}/v2","CC BY 4.0","Source: World Bank, World Development Indicators, indicator codes shown in the database. Licensed under CC BY 4.0.",AS_OF),
+        ("WB_WDI","World Bank","World Development Indicators","https://datacatalog.worldbank.org/search/dataset/0037712/world-development-indicators",WB_API,"CC BY 4.0","Source: World Bank, World Development Indicators, indicator codes shown in the database. Licensed under CC BY 4.0.",AS_OF),
         ("IMF_QNEA","International Monetary Fund","National Economic Accounts (NEA), Quarterly Data","https://data.imf.org/en/datasets/IMF.STA%3AQNEA",f"{IMF_API}/data/IMF.STA,QNEA","IMF statistical-data use terms; cite IMF and dataset; preserve any third-party attribution.","Source: International Monetary Fund, National Economic Accounts (NEA), Quarterly Data.",AS_OF),
         ("IMF_CPI","International Monetary Fund","Consumer Price Index (CPI)","https://data.imf.org/en/datasets/IMF.STA%3ACPI",f"{IMF_API}/data/IMF.STA,CPI","IMF statistical-data use terms; cite IMF and dataset; preserve any third-party attribution.","Source: International Monetary Fund, Consumer Price Index (CPI).",AS_OF),
         ("IMF_MFS_IR","International Monetary Fund","Monetary and Financial Statistics (MFS), Interest Rate","https://data.imf.org/en/datasets/IMF.STA%3AMFS_IR",f"{IMF_API}/data/IMF.STA,MFS_IR","IMF statistical-data use terms; cite IMF and dataset; preserve any third-party attribution.","Source: International Monetary Fund, Monetary and Financial Statistics (MFS), Interest Rate.",AS_OF),
         ("IMF_PPI","International Monetary Fund","Producer Price Index (PPI)","https://data.imf.org/en/datasets/IMF.STA%3APPI",f"{IMF_API}/data/IMF.STA,PPI","IMF statistical-data use terms; cite IMF and dataset; preserve any third-party attribution.","Source: International Monetary Fund, Producer Price Index (PPI). This is not a wholesale price index.",AS_OF),
+        ("IN_OEA_WPI","Government of India, Office of the Economic Adviser","Wholesale Price Index, base 2022-23","https://eaindustry.nic.in/download_data_2223.asp","https://eaindustry.nic.in/indx_download_2223/","Government of India source; consult the publisher's reuse terms before redistribution.","Source: Office of the Economic Adviser, DPIIT, Government of India, WPI base 2022-23.",AS_OF),
     ]
     conn.executemany("INSERT INTO sources VALUES(?,?,?,?,?,?,?,?)", source_rows)
     conn.execute("INSERT INTO schema_meta VALUES('schema_version','1.0')")
@@ -361,11 +663,13 @@ def main() -> int:
     for code, name, unit, definition in DERIVED_INDICATORS:
         add_indicator(conn, code, name, "quarterly" if "quarterly" in code else "annual", unit, definition,
                       "IMF_QNEA" if "quarterly" in code else "WB_WDI", None, definition)
-    add_indicator(conn,"cpi_index_all_items_monthly_imf","CPI, all items (monthly)","monthly","index points (national reference period varies)","IMF all-items CPI index. Index reference period is preserved in observation metadata; do not compare index levels across economies.","IMF_CPI","CPI._T.IX.M")
-    add_indicator(conn,"inflation_consumer_prices_yoy_pct_monthly_imf","CPI inflation, year over year (monthly)","monthly","percent","IMF-reported year-on-year percent change in the all-items CPI.","IMF_CPI","CPI._T.YOY_PCH_PA_PT.M")
-    add_indicator(conn,"central_bank_policy_rate_pct_pa_monthly_imf","Central bank policy rate","monthly","percent per annum","IMF MFS_IR series MFS166_RT_PT_A_PT; reported monthly policy/central-bank rate.","IMF_MFS_IR","MFS166_RT_PT_A_PT.M")
-    add_indicator(conn,"producer_price_index_monthly_imf","Producer price index (monthly)","monthly","index points (reference period varies)","IMF PPI index. This is a related producer-price measure, not a wholesale price index (WPI).","IMF_PPI","PPI.IX.M")
-    add_indicator(conn,"wholesale_price_index_monthly","Wholesale price index (WPI)","monthly","index points (country-specific base)","Country-specific WPI series are not harmonized into this global release. IMF PPI is stored separately and must not be relabelled as WPI.",None,None,availability="not_loaded_country_specific_sources_required")
+    for code,name,unit,definition in QUARTERLY_PRICE_INDICATORS[:4]:
+        source = "IMF_CPI" if code.startswith("cpi_") or code.startswith("inflation_") else "IMF_MFS_IR" if code.startswith("central_bank_") else "IMF_PPI"
+        series = "CPI._T.IX.M" if code.startswith("cpi_") or code.startswith("inflation_") else "MFS166_RT_PT_A_PT.M" if code.startswith("central_bank_") else "PPI.IX.M"
+        add_indicator(conn,code,name,"quarterly",unit,definition,source,series,definition)
+    add_indicator(conn,QUARTERLY_PRICE_INDICATORS[4][0],QUARTERLY_PRICE_INDICATORS[4][1],"quarterly",
+                  QUARTERLY_PRICE_INDICATORS[4][2],QUARTERLY_PRICE_INDICATORS[4][3],"IN_OEA_WPI",
+                  "OEA_WPI|ALL_COMMODITIES|2022-23=100","Arithmetic mean of monthly WPI observations; complete quarters only.")
 
     wb_codes = list(WB_SERIES)
     wb_data, wb_snapshots = wb_observations(wb_codes, country_codes, end_year)
@@ -403,23 +707,24 @@ def main() -> int:
                 add_observation(conn,country=country,indicator=out_code,period=str(year),frequency="annual",value=result,raw=None,status="derived",source="WB_WDI",series_code=f"calculated:{input_code}:year_over_year",metadata={"formula":"100 * (current_year / prior_year - 1)","nominal_growth_basis":"current local currency"})
     conn.commit()
 
-    if not args.include_imf:
-        conn.execute("UPDATE indicators SET availability='awaiting_imf_api_access' WHERE source_id IN ('IMF_QNEA','IMF_CPI','IMF_MFS_IR','IMF_PPI')")
-        conn.execute("UPDATE indicators SET availability='country_specific_sources_required' WHERE indicator_code='wholesale_price_index_monthly'")
-        for source_id,url,note in [
-            ("IMF_QNEA","https://data.imf.org/en/datasets/IMF.STA%3AQNEA","Not fetched: IMF API access was not configured for this build."),
-            ("IMF_CPI","https://data.imf.org/en/datasets/IMF.STA%3ACPI","Not fetched: IMF API access was not configured for this build."),
-            ("IMF_MFS_IR","https://data.imf.org/en/datasets/IMF.STA%3AMFS_IR","Not fetched: IMF API access was not configured for this build."),
-            ("IMF_PPI","https://data.imf.org/en/datasets/IMF.STA%3APPI","Not fetched: IMF API access was not configured for this build."),
+    if args.annual_only:
+        conn.execute("UPDATE indicators SET availability='not_fetched_annual_only' WHERE source_id LIKE 'IMF_%' OR source_id='IN_OEA_WPI'")
+        for source_id,url in [
+            ("IMF_QNEA","https://data.imf.org/en/datasets/IMF.STA%3AQNEA"),
+            ("IMF_CPI","https://data.imf.org/en/datasets/IMF.STA%3ACPI"),
+            ("IMF_MFS_IR","https://data.imf.org/en/datasets/IMF.STA%3AMFS_IR"),
+            ("IMF_PPI","https://data.imf.org/en/datasets/IMF.STA%3APPI"),
+            ("IN_OEA_WPI","https://eaindustry.nic.in/download_data_2223.asp"),
         ]:
-            conn.execute("INSERT INTO source_snapshots(source_id,retrieved_at,request_url,returned_rows,provider_update_date,notes) VALUES(?,?,?,?,?,?)",(source_id,now,url,0,None,note))
-        conn.execute("INSERT INTO schema_meta VALUES('frequency_policy','Populated release: annual WDI observations from 2000. Quarterly and monthly IMF indicators are registered but not populated until IMF API access is configured.')")
-        conn.execute("INSERT INTO schema_meta VALUES('gap_policy','No zero-fill or unlabelled interpolation. Annual poverty observations retain their survey-based frequency. Missing IMF monthly and quarterly values remain absent.')")
+            conn.execute("INSERT INTO source_snapshots(source_id,retrieved_at,request_url,returned_rows,provider_update_date,notes) VALUES(?,?,?,?,?,?)",(source_id,now,url,0,None,"Skipped because --annual-only was selected."))
+        conn.execute("INSERT INTO schema_meta VALUES('frequency_policy','Annual WDI observations from 2000 only; quarterly IMF and India WPI series omitted by --annual-only.')")
+        conn.execute("INSERT INTO schema_meta VALUES('gap_policy','No zero-fill or unlabelled interpolation. Annual poverty observations retain their survey-based observation years.')")
         conn.commit()
-        conn.execute("PRAGMA optimize")
-        conn.close()
+        publish_database(conn,building_path,args.output)
         print(f"SQLite release saved: {args.output}", flush=True)
-        print("WDI annual data are populated. IMF indicators are registered and marked awaiting_imf_api_access.", flush=True)
+        exports = export_release(args.output)
+        print("Companion files saved: " + ", ".join(str(path) for path in exports), flush=True)
+        print("Annual WDI data are populated; quarterly data were skipped by request.", flush=True)
         return 0
 
     # IMF QNEA: nominal (V) and real chain-volume (Q), in domestic currency.
@@ -437,11 +742,12 @@ def main() -> int:
         for row in rows:
             dims=row["dims"]
             country=dims.get("COUNTRY")
-            if country not in country_codes:
+            if country not in country_codes or not public_imf_row(row):
                 continue
             series_code=f"QNEA|{dims.get('INDICATOR')}|{price_type}|{adjustment}|{dims.get('TYPE_OF_TRANSFORMATION')}|{dims.get('FREQUENCY')}"
             attrs={k:v for k,v in row["obs_attrs"].items() if k not in ("TIME_PERIOD","OBS_VALUE")}
-            add_observation(conn,country=country,indicator=slug,period=row["period"],frequency="quarterly",value=row["value"],raw=row["raw"],status="observed",source="IMF_QNEA",series_code=series_code,seasonal=adjustment,metadata=attrs,series_metadata=dims)
+            qne_status="observed" if attrs.get("DERIVATION_TYPE","O")=="O" else "estimated"
+            add_observation(conn,country=country,indicator=slug,period=row["period"],frequency="quarterly",value=row["value"],raw=row["raw"],status=qne_status,source="IMF_QNEA",series_code=series_code,seasonal=adjustment,metadata=attrs,series_metadata=dims)
             qne_records.append({"country":country,"slug":slug,"period":row["period"],"value":row["value"],"series_code":series_code,"seasonal":adjustment})
     conn.executemany("INSERT INTO source_snapshots(source_id,retrieved_at,request_url,returned_rows,provider_update_date,notes) VALUES(?,?,?,?,?,?)",qne_snapshots)
     conn.commit()
@@ -515,57 +821,64 @@ def main() -> int:
         derive_quarter_growth(base,out,1,"SA")
     conn.commit()
 
-    # IMF monthly CPI: all-items index and source-reported year-on-year rate.
+    # Fetch monthly source files, aggregate them, and store quarterly observations only.
     month_end=f"{end_year}-M{end_month:02d}"
     month_start=f"{START_YEAR}-M01"
-    cpi_defs=[(".CPI._T.IX.M","cpi_index_all_items_monthly_imf","IMF CPI all-items index (IX)."),
-              (".CPI._T.YOY_PCH_PA_PT.M","inflation_consumer_prices_yoy_pct_monthly_imf","IMF all-items CPI year-on-year percentage change.")]
-    cpi_snaps=[]
-    for key,slug,note in cpi_defs:
-        rows,url=imf_request("CPI",key,month_start,month_end)
-        cpi_snaps.append(("IMF_CPI",now,url,len(rows),None,note))
-        for row in rows:
-            country=row["dims"].get("COUNTRY")
-            if country not in country_codes:
-                continue
-            dims=row["dims"]
-            series_code=f"CPI|{dims.get('INDEX_TYPE')}|{dims.get('COICOP_1999')}|{dims.get('TYPE_OF_TRANSFORMATION')}|{dims.get('FREQUENCY')}"
-            ref={k:v for k,v in row["obs_attrs"].items() if k not in ("TIME_PERIOD","OBS_VALUE")}
-            status="estimated" if row["obs_attrs"].get("DERIVATION_TYPE","O")!="O" else "observed"
-            add_observation(conn,country=country,indicator=slug,period=row["period"],frequency="monthly",value=row["value"],raw=row["raw"],status=status,source="IMF_CPI",series_code=series_code,metadata=ref,series_metadata=dims)
-    conn.executemany("INSERT INTO source_snapshots(source_id,retrieved_at,request_url,returned_rows,provider_update_date,notes) VALUES(?,?,?,?,?,?)",cpi_snaps)
+    cpi_monthly,cpi_url=imf_request("CPI",".CPI._T.IX.M",month_start,month_end)
+    cpi_quarterly=aggregate_imf_monthly(cpi_monthly,country_codes,"quarterly_mean")
+    for row in cpi_quarterly:
+        add_observation(conn,country=row["country"],indicator="cpi_index_all_items_quarterly_imf",period=row["period"],
+                        frequency="quarterly",value=row["value"],raw=None,status=row["status"],source="IMF_CPI",
+                        series_code=row["series_code"],metadata=row["metadata"],
+                        series_metadata={**row["dims"],"quarterly_aggregation":"arithmetic_mean_of_three_months"})
+    cpi_inflation_count=add_quarterly_cpi_inflation(conn,cpi_quarterly)
+    conn.execute("INSERT INTO source_snapshots(source_id,retrieved_at,request_url,returned_rows,provider_update_date,notes) VALUES(?,?,?,?,?,?)",
+                 ("IMF_CPI",now,cpi_url,len(cpi_monthly),None,"Monthly all-items CPI fetched from IMF; three observations averaged per quarter. Monthly values are not stored."))
     conn.commit()
-    print(f"IMF monthly CPI observations loaded: {sum(x[3] for x in cpi_snaps):,}", flush=True)
+    print(f"IMF quarterly CPI observations loaded: {len(cpi_quarterly):,}; derived quarterly inflation: {cpi_inflation_count:,}", flush=True)
 
-    # IMF monthly central-bank policy rate and producer-price index.
+    # Quarter-end policy rate and quarterly mean PPI; no monthly observations enter SQLite.
     high_freq=[
-        ("MFS_IR",".MFS166_RT_PT_A_PT.M","central_bank_policy_rate_pct_pa_monthly_imf","IMF_MFS_IR","MFS166_RT_PT_A_PT.M","Central bank policy rate, percent per annum."),
-        ("PPI",".PPI.IX.M","producer_price_index_monthly_imf","IMF_PPI","PPI.IX.M","Producer price index; retained separately from WPI."),
+        ("MFS_IR",".MFS166_RT_PT_A_PT.M","central_bank_policy_rate_pct_pa_quarterly_imf","IMF_MFS_IR","quarter_end","Central bank policy rate: last reported monthly value in each quarter."),
+        ("PPI",".PPI.IX.M","producer_price_index_quarterly_imf","IMF_PPI","quarterly_mean","Producer price index: mean of three monthly index values; separate from WPI."),
     ]
-    for flow,key,slug,source,series_prefix,note in high_freq:
+    for flow,key,slug,source,method,note in high_freq:
         rows,url=imf_request(flow,key,month_start,month_end)
-        conn.execute("INSERT INTO source_snapshots(source_id,retrieved_at,request_url,returned_rows,provider_update_date,notes) VALUES(?,?,?,?,?,?)",(source,now,url,len(rows),None,note))
-        for row in rows:
-            country=row["dims"].get("COUNTRY")
-            if country not in country_codes:
-                continue
-            dims=row["dims"]
-            series_code=f"{flow}|"+"|".join(f"{k}={dims[k]}" for k in sorted(dims) if k != "COUNTRY")
-            attrs={k:v for k,v in row["obs_attrs"].items() if k not in ("TIME_PERIOD","OBS_VALUE")}
-            status="estimated" if row["obs_attrs"].get("DERIVATION_TYPE","O")!="O" else "observed"
-            add_observation(conn,country=country,indicator=slug,period=row["period"],frequency="monthly",value=row["value"],raw=row["raw"],status=status,source=source,series_code=series_code,metadata=attrs,series_metadata=dims)
+        quarterly=aggregate_imf_monthly(rows,country_codes,method)
+        for row in quarterly:
+            add_observation(conn,country=row["country"],indicator=slug,period=row["period"],frequency="quarterly",
+                            value=row["value"],raw=None,status=row["status"],source=source,series_code=row["series_code"],
+                            metadata=row["metadata"],series_metadata={**row["dims"],"quarterly_aggregation":method})
+        conn.execute("INSERT INTO source_snapshots(source_id,retrieved_at,request_url,returned_rows,provider_update_date,notes) VALUES(?,?,?,?,?,?)",
+                     (source,now,url,len(rows),None,f"{note} Monthly source observations fetched: {len(rows)}; only quarterly outputs are stored."))
         conn.commit()
-        print(f"{flow} observations loaded: {len(rows):,} (before WDI-country filter)", flush=True)
+        print(f"{flow} quarterly observations loaded: {len(quarterly):,}", flush=True)
 
-    # A CPI series without monthly data or a quarterly series without a reported value stays absent.
-    # Absence means unavailable; it is never converted to zero or silently interpolated.
+    # India WPI is published monthly; aggregate the all-commodities row to quarters.
+    wpi_quarterly,wpi_url,wpi_month_count=fetch_india_wpi_quarterly()
+    for row in wpi_quarterly:
+        add_observation(conn,country=row["country"],indicator="wholesale_price_index_quarterly",period=row["period"],
+                        frequency="quarterly",value=row["value"],raw=None,status=row["status"],source="IN_OEA_WPI",
+                        series_code=row["series_code"],metadata=row["metadata"],
+                        series_metadata={"source":"Office of the Economic Adviser, DPIIT, Government of India",
+                                         "base_period":"2022-23=100","source_row_code":"1000000000"})
+    conn.execute("INSERT INTO source_snapshots(source_id,retrieved_at,request_url,returned_rows,provider_update_date,notes) VALUES(?,?,?,?,?,?)",
+                 ("IN_OEA_WPI",now,wpi_url,wpi_month_count,None,"Official WPI workbook downloaded; all-commodities monthly index aggregated to complete calendar quarters. Monthly values are not stored."))
+
+    # Indicators are considered loaded only when the refreshed snapshot contains observations.
+    conn.execute("""UPDATE indicators SET availability=CASE
+                  WHEN EXISTS (SELECT 1 FROM observations o WHERE o.indicator_code=indicators.indicator_code)
+                  THEN 'loaded' ELSE 'no_source_observations' END
+                  WHERE source_id IN ('IMF_QNEA','IMF_CPI','IMF_MFS_IR','IMF_PPI','IN_OEA_WPI')""")
+    # No monthly observations are stored. Absence is unavailable, never zero-filled.
     conn.execute("INSERT INTO schema_meta VALUES('retrieved_at_utc',?)", (now,))
-    conn.execute("INSERT INTO schema_meta VALUES('frequency_policy','Quarterly national accounts from IMF QNEA where reported; monthly CPI, policy rate and PPI from IMF; annual WDI indicators from 2000; poverty retains survey-based observations.')")
-    conn.execute("INSERT INTO schema_meta VALUES('gap_policy','No zero-fill or unlabelled interpolation. Derived quarterly GDP per capita is marked estimated and documents population interpolation.')")
+    conn.execute("INSERT INTO schema_meta VALUES('frequency_policy','Annual WDI indicators from 2000; IMF quarterly GDP and quarterly price/rate series where reported; monthly IMF CPI, policy-rate and PPI source observations are aggregated and not stored; India WPI is quarterly from the official 2022-23 base series.')")
+    conn.execute("INSERT INTO schema_meta VALUES('gap_policy','No zero-fill or unlabelled interpolation. CPI/PPI/WPI quarterly means require three monthly source observations; quarter-end policy rates use the latest reported month in each quarter. Quarterly GDP per capita is estimated from annual population interpolation. Poverty observations remain survey-year based.')")
     conn.commit()
-    conn.execute("PRAGMA optimize")
-    conn.close()
+    publish_database(conn,building_path,args.output)
     print(f"SQLite release saved: {args.output}", flush=True)
+    exports = export_release(args.output)
+    print("Companion files saved: " + ", ".join(str(path) for path in exports), flush=True)
     print("Economy counts and actual date ranges are available in the indicator_coverage view.", flush=True)
     return 0
 
